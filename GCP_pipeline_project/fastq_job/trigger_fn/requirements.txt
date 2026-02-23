@@ -1,0 +1,2 @@
+google-cloud-run==0.10.7
+
