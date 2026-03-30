@@ -1,19 +1,16 @@
 import json
 import os
-import subprocess
 from typing import Any, Dict
+
+from google.cloud import run_v2
 
 from db import create_pipeline_run, get_db_connection, upsert_sample
 
 
-def gcs_finalize_handler(event: Dict[str, Any], context: Any = None):
-    """
-    Triggered by GCS object finalize event.
-    Expected event fields include:
-      - bucket
-      - name
-    """
+CONTAINER_NAME = os.getenv("JOB_CONTAINER_NAME", "worker")
 
+
+def gcs_finalize_handler(event: Dict[str, Any], context: Any = None):
     bucket = event.get("bucket")
     file_name = event.get("name")
 
@@ -21,14 +18,9 @@ def gcs_finalize_handler(event: Dict[str, Any], context: Any = None):
         print("Missing bucket or file name in event payload.")
         return ("Bad Request", 400)
 
-    # Optional: only process FASTQ-ish files
-    if not (
-        file_name.endswith(".fastq")
-        or file_name.endswith(".fq")
-        or file_name.endswith(".fastq.gz")
-        or file_name.endswith(".fq.gz")
-    ):
-        print(f"Skipping non-FASTQ file: {file_name}")
+    # Only launch the batch job when the marker file is uploaded
+    if file_name != "data/READY.txt":
+        print(f"Skipping non-marker file: {file_name}")
         return ("Skipped", 200)
 
     input_uri = f"gs://{bucket}/{file_name}"
@@ -36,7 +28,12 @@ def gcs_finalize_handler(event: Dict[str, Any], context: Any = None):
 
     conn = get_db_connection()
     try:
-        sample_id = upsert_sample(conn, input_uri=input_uri, file_name=file_name, bucket_name=bucket)
+        sample_id = upsert_sample(
+            conn,
+            input_uri=input_uri,
+            file_name=file_name,
+            bucket_name=bucket,
+        )
         run_id = create_pipeline_run(
             conn,
             sample_id=sample_id,
@@ -46,32 +43,50 @@ def gcs_finalize_handler(event: Dict[str, Any], context: Any = None):
     finally:
         conn.close()
 
-    project = os.environ["GCP_PROJECT"]
-    region = os.environ["CLOUD_RUN_REGION"]
-    job_name = os.environ["CLOUD_RUN_JOB_NAME"]
+    project = os.environ["PROJECT_ID"]
+    region = os.environ["REGION"]
+    job_name = os.environ["JOB_NAME"]
 
-    # Launch Cloud Run Job and override env vars for this execution
-    cmd = [
-        "gcloud",
-        "run",
-        "jobs",
-        "execute",
-        job_name,
-        "--region",
-        region,
-        "--project",
-        project,
-        "--update-env-vars",
-        f"INPUT_URI={input_uri},RUN_ID={run_id}",
-    ]
+    client = run_v2.JobsClient()
+    job_path = client.job_path(project, region, job_name)
 
-    print("Executing command:", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    request = run_v2.RunJobRequest(
+        name=job_path,
+        overrides=run_v2.RunJobRequest.Overrides(
+            container_overrides=[
+                run_v2.RunJobRequest.Overrides.ContainerOverride(
+                    name=CONTAINER_NAME,
+                    env=[
+                        run_v2.EnvVar(name="INPUT_URI", value=input_uri),
+                        run_v2.EnvVar(name="RUN_ID", value=str(run_id)),
+                    ],
+                )
+            ]
+        ),
+    )
 
-    print("STDOUT:", result.stdout)
-    print("STDERR:", result.stderr)
+    operation = client.run_job(request=request)
 
-    if result.returncode != 0:
-        return (f"Failed to launch Cloud Run Job: {result.stderr}", 500)
+    print(
+        json.dumps(
+            {
+                "message": "Job launched",
+                "run_id": run_id,
+                "input_uri": input_uri,
+                "job_path": job_path,
+                "container_name": CONTAINER_NAME,
+                "operation": operation.operation.name,
+            }
+        )
+    )
 
-    return (json.dumps({"message": "Job launched", "run_id": run_id, "input_uri": input_uri}), 200)
+    return (
+        json.dumps(
+            {
+                "message": "Job launched",
+                "run_id": run_id,
+                "input_uri": input_uri,
+            }
+        ),
+        200,
+    )  
