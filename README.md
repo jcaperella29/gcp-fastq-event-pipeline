@@ -1,193 +1,134 @@
-# Event-Driven FASTQ Processing Pipeline (GCP)
 
-## 🚀 Overview
+   - demultiplexes reads by barcode
+   - aligns reads with BWA
+   - sorts and indexes BAMs with samtools
+   - counts features with featureCounts
+   - generates output artifacts
+6. Outputs are written to the results bucket.
+7. Run status and output metadata are updated in Cloud SQL.
 
-This project demonstrates a **cloud-native, event-driven bioinformatics pipeline** on Google Cloud Platform.
+## Current Inputs
 
-When a FASTQ file is uploaded to Cloud Storage, the system automatically:
+### Ingest bucket
+The pipeline scans a GCS folder for FASTQ files, for example:
 
-1. Detects the upload event  
-2. Triggers a serverless function  
-3. Launches a containerized batch job  
-4. Computes alignment and gene-level metrics  
-5. Writes structured results to BigQuery  
-6. Produces a pivoted gene × sample matrix  
+`gs://<ingest-bucket>/data/`
 
-This mirrors real-world genomics data platform patterns used in production environments.
+### Marker file
+A batch is triggered by uploading:
 
----
+`gs://<ingest-bucket>/data/READY.txt`
 
-## 🏗️ Architecture
+### Reference assets
+The analysis job expects reference files such as:
 
-Cloud Storage (ingest bucket)
-↓ (object finalize event)
-Eventarc Trigger
-↓
-Cloud Function (glue)
-↓
-Cloud Run Job (containerized compute)
-↓
-BigQuery (normalized tables)
-↓
-BigQuery SQL Pivot (gene × sample matrix)
-Cloud Storage (ingest bucket)
+- `reference.fasta`
+- `annotation.gtf`
+
+These are typically stored in a separate reference bucket.
+
+## Current Outputs
+
+For each pipeline run, the job writes:
+
+- **QC summary JSON**  
+  Contains run-level statistics such as reads processed, assigned reads, GC percentage, and processed input files.
+
+- **Count matrix CSV**  
+  Gene-level counts by sample.
+
+- **BED file**  
+  Read-level genomic interval output derived from alignments.
+
+Example output layout:
+
+```text
+gs://<results-bucket>/qc-results/run_<RUN_ID>.json
+gs://<results-bucket>/count-matrices/count_matrix_run_<RUN_ID>.csv
+gs://<results-bucket>/beds/reads_run_<RUN_ID>.bed
 
 
-### Key properties
+Barcode Demultiplexing
 
-* Event-driven (no manual job submission)
-* Fully serverless orchestration
-* Containerized bioinformatics compute
-* Warehouse-ready normalized schema
-* SQL-based matrix generation
-* Easily extensible to real NGS workflows
+The current implementation uses fixed barcodes to split reads into samples before alignment.
 
----
+Example mapping:
 
-## 📦 Components
+ACGTACGT → sample1
+TGCATGCA → sample2
+GATTACAG → sample3
 
-### 1. Cloud Function (`trigger_fn/`)
+These values are currently hard-coded in the analysis job and can be extended or externalized in future versions.
 
-Responsible for:
-
-* Receiving GCS finalize events
-* Constructing the FASTQ input URI
-* Launching the Cloud Run Job with environment variables
-* Acting as the event-driven control plane
-
----
-
-### 2. Cloud Run Job (`fastq_job/`)
-
-Containerized batch job that performs:
-
-#### FASTQ processing
-
-* Download FASTQ from GCS
-* Align reads with **BWA**
-* Process BAM with **samtools**
-* Generate gene counts with **featureCounts**
-
-#### QC + metrics
-
-Computes:
-
-* read count  
-* total bases  
-* average read length  
-* GC percentage  
-
-#### Warehouse loading
-
-Writes structured results into BigQuery tables:
-
-* `fastq_qc.qc_runs`
-* `fastq_qc.contig_counts`
-* `fastq_qc.gene_counts`
-
----
-
-### 3. Fake data generator
-
-`make_fake_fastq.py` creates synthetic FASTQ data for testing and pipeline validation.
-
----
-
-## 🧪 Example BigQuery Pivot
-
-After multiple samples are processed, the pipeline supports warehouse-native matrix generation:
-
-```sql
-SELECT *
-FROM (
-  SELECT sample_name, gene_id, count
-  FROM `fastq-data-pipeline.fastq_qc.gene_counts`
-  WHERE sample_name IS NOT NULL
-)
-PIVOT (
-  SUM(count) FOR sample_name IN (
-    "sample_align1.fastq" AS sample_align1,
-    "sample_align2.fastq" AS sample_align2,
-    "sample_align3.fastq" AS sample_align3
-  )
-)
-ORDER BY gene_id;
-
-🛠️ Tech Stack
-
-Cloud & Orchestration
-
-Google Cloud Functions (Gen2)
-
-Eventarc
-
-Cloud Run Jobs
-
-Cloud Storage
-
-BigQuery
-
-Bioinformatics
-
-BWA
-
-samtools
-
-featureCounts
-
-Runtime
-
+Tech Stack
 Python 3.11
-
+Google Cloud Storage
+Google Cloud Functions Gen 2
+Google Cloud Run Jobs
+Google Cloud SQL
 Docker
+BWA
+samtools
+featureCounts
+Repository Structure
 
-🎯 Why this project matters
 
-This project demonstrates patterns used in:
 
-Genomics data platforms
+Deployment Summary
+Cloud Run Job
 
-Scientific ETL pipelines
+The Cloud Run Job runs the analysis container and expects environment variables such as:
 
-ML feature pipelines
+DATA_DIR
+REFERENCE_FASTA
+ANNOTATION_GTF
+RESULTS_BUCKET
+RUN_ID
+Trigger Function
 
-Production bioinformatics backends
+The Cloud Function:
 
-Modern serverless architectures
+listens to the ingest bucket
+ignores normal FASTQ uploads
+launches the Cloud Run Job only when data/READY.txt is uploaded
+Example Usage
+Upload FASTQ files:
+gsutil cp data/sample1.fastq gs://<ingest-bucket>/data/
+gsutil cp data/sample2.fastq gs://<ingest-bucket>/data/
+gsutil cp data/sample3.fastq gs://<ingest-bucket>/data/
 
-It showcases:
+Upload marker file:
+echo ready > READY.txt
+gsutil cp READY.txt gs://<ingest-bucket>/data/READY.txt
 
-event-driven design
+What This Project Demonstrates
 
-cloud-native orchestration
+This project is intended to show:
 
-containerized bioinformatics workloads
+cloud-native pipeline orchestration
+event-driven batch processing
+managed container execution
+run tracking with a relational database
+integration of standard bioinformatics tools into a reproducible workflow
+generation of structured output artifacts for downstream analysis
+Current Status
 
-warehouse-ready data modeling
+This pipeline is a strong prototype and architecture demonstration. It uses standard alignment and counting tools, but current testing has focused primarily on synthetic datasets and workflow validation. Additional validation on public biological datasets, stricter filtering, and expanded QC are natural next steps.
 
-SQL-based analytical pivoting
+Future Improvements
 
-end-to-end automated sample processing
+Planned or possible next steps include:
 
-🔮 Possible Extensions
+validation on real public datasets
+stricter alignment filtering and QC thresholds
+support for paired-end reads
+external barcode/sample manifests
+richer QC reporting
+downstream visualization dashboards
+workflow packaging with WDL or Nextflow
+support for larger references and more realistic transcriptomic workflows
+Why This Project Matters
 
-Multi-sample fan-out
+Many pipelines work locally but fail when moved into a cloud production context. This project focuses on solving the engineering side of that transition: automated triggering, containerized execution, cloud-based tracking, and reproducible artifact generation.
 
-Workflows / Cromwell DAG integration
-
-Partitioned BigQuery tables
-
-Looker / dashboard layer
-
-Retry & idempotency hardening
-
-FastQC / seqkit integration
-
-Metadata lineage tracking
-
-Multi-region scaling
-
-👤 Author
-
-JC
-Bioinformatics • Scientific Software Engineering • Cloud Genomics
+It is designed as a practical example of how bioinformatics workflows can be deployed as managed, event-driven systems in the cloud.
