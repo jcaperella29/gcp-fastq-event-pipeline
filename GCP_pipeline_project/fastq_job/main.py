@@ -21,6 +21,19 @@ BARCODE_TO_SAMPLE = {
 }
 BARCODE_LENGTH = 8
 
+MIN_POST_BARCODE_LENGTH = int(os.getenv("MIN_POST_BARCODE_LENGTH", "30"))
+MIN_MEAN_QUAL = float(os.getenv("MIN_MEAN_QUAL", "20"))
+MAX_N_FRAC = float(os.getenv("MAX_N_FRAC", "0.05"))
+MIN_MAPQ = int(os.getenv("MIN_MAPQ", "20"))
+
+FEATURECOUNTS_STRAND = os.getenv("FEATURECOUNTS_STRAND", "0")
+FEATURECOUNTS_PAIRED = os.getenv("FEATURECOUNTS_PAIRED", "false").lower() in {"1", "true", "yes"}
+FEATURECOUNTS_COUNT_PRIMARY_ONLY = os.getenv("FEATURECOUNTS_COUNT_PRIMARY_ONLY", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
 
 def parse_gcs_uri(uri: str):
     parsed = urlparse(uri)
@@ -168,6 +181,19 @@ def open_fastq(path: str):
     return open(path, "r")
 
 
+def mean_phred(qual: str) -> float:
+    if not qual:
+        return 0.0
+    return sum(ord(c) - 33 for c in qual) / len(qual)
+
+
+def compute_gc_percent(seq: str) -> float:
+    if not seq:
+        return 0.0
+    gc = sum(1 for b in seq.upper() if b in {"G", "C"})
+    return 100.0 * gc / len(seq)
+
+
 def demultiplex_fastqs(local_fastqs: list[str], out_dir: str):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -183,6 +209,12 @@ def demultiplex_fastqs(local_fastqs: list[str], out_dir: str):
         "total_bases": 0,
         "gc_bases": 0,
         "barcode_unassigned_reads": 0,
+        "filtered_too_short_reads": 0,
+        "filtered_low_quality_reads": 0,
+        "filtered_high_n_reads": 0,
+        "reads_written_after_filters": 0,
+        "bases_written_after_filters": 0,
+        "gc_bases_written_after_filters": 0,
         "reads_per_sample": {sample: 0 for sample in sample_fastq_paths},
     }
 
@@ -218,41 +250,115 @@ def demultiplex_fastqs(local_fastqs: list[str], out_dir: str):
                         metrics["barcode_unassigned_reads"] += 1
                         continue
 
+                    if len(trimmed_seq) < MIN_POST_BARCODE_LENGTH:
+                        metrics["filtered_too_short_reads"] += 1
+                        continue
+
+                    n_frac = trimmed_seq.upper().count("N") / len(trimmed_seq)
+                    if n_frac > MAX_N_FRAC:
+                        metrics["filtered_high_n_reads"] += 1
+                        continue
+
+                    if mean_phred(trimmed_qual) < MIN_MEAN_QUAL:
+                        metrics["filtered_low_quality_reads"] += 1
+                        continue
+
                     out = handles[sample_name]
                     out.write(header)
                     out.write(trimmed_seq + "\n")
                     out.write(plus)
                     out.write(trimmed_qual + "\n")
+
                     metrics["reads_per_sample"][sample_name] += 1
+                    metrics["reads_written_after_filters"] += 1
+                    metrics["bases_written_after_filters"] += len(trimmed_seq)
+                    metrics["gc_bases_written_after_filters"] += sum(
+                        1 for b in trimmed_seq.upper() if b in {"G", "C"}
+                    )
     finally:
         for h in handles.values():
             h.close()
 
-    avg_read_length = (
+    avg_read_length_raw = (
         metrics["total_bases"] / metrics["total_reads"] if metrics["total_reads"] else 0.0
     )
-    gc_percent = (
+    gc_percent_raw = (
         100.0 * metrics["gc_bases"] / metrics["total_bases"] if metrics["total_bases"] else 0.0
     )
+    avg_read_length_filtered = (
+        metrics["bases_written_after_filters"] / metrics["reads_written_after_filters"]
+        if metrics["reads_written_after_filters"]
+        else 0.0
+    )
+    gc_percent_filtered = (
+        100.0 * metrics["gc_bases_written_after_filters"] / metrics["bases_written_after_filters"]
+        if metrics["bases_written_after_filters"]
+        else 0.0
+    )
 
-    metrics["avg_read_length"] = round(avg_read_length, 2)
-    metrics["gc_percent"] = round(gc_percent, 2)
+    metrics["avg_read_length"] = round(avg_read_length_raw, 2)
+    metrics["gc_percent"] = round(gc_percent_raw, 2)
+    metrics["avg_read_length_after_filters"] = round(avg_read_length_filtered, 2)
+    metrics["gc_percent_after_filters"] = round(gc_percent_filtered, 2)
 
     return sample_fastq_paths, metrics
 
 
-def align_and_sort_bam(sample_fastq_paths: dict[str, str], reference_fasta: str, out_dir: str):
+def parse_flagstat_summary(flagstat_text: str) -> dict[str, int]:
+    metrics = {
+        "total": 0,
+        "mapped": 0,
+        "secondary": 0,
+        "supplementary": 0,
+        "duplicates": 0,
+    }
+
+    for line in flagstat_text.splitlines():
+        stripped = line.strip()
+        if " in total " in stripped:
+            metrics["total"] = int(stripped.split()[0])
+        elif " secondary" in stripped:
+            metrics["secondary"] = int(stripped.split()[0])
+        elif " supplementary" in stripped:
+            metrics["supplementary"] = int(stripped.split()[0])
+        elif " duplicates" in stripped:
+            metrics["duplicates"] = int(stripped.split()[0])
+        elif " mapped " in stripped and "primary mapped" not in stripped:
+            metrics["mapped"] = int(stripped.split()[0])
+
+    return metrics
+
+
+def count_bam_reads(bam_path: str) -> int:
+    result = run_cmd(["samtools", "view", "-c", bam_path])
+    return int(result.stdout.strip())
+
+
+def align_and_filter_bam(sample_fastq_paths: dict[str, str], reference_fasta: str, out_dir: str):
     os.makedirs(out_dir, exist_ok=True)
 
     run_cmd(["bwa", "index", reference_fasta])
 
     bam_paths = {}
+    alignment_metrics = {}
+
     for sample, fastq_path in sample_fastq_paths.items():
         if os.path.getsize(fastq_path) == 0:
+            alignment_metrics[sample] = {
+                "reads_entering_alignment": 0,
+                "aligned_total_records_pre_filter": 0,
+                "mapped_pre_filter": 0,
+                "secondary_pre_filter": 0,
+                "supplementary_pre_filter": 0,
+                "duplicates_pre_filter": 0,
+                "records_post_filter": 0,
+                "records_removed_by_bam_filter": 0,
+            }
             continue
 
         sam_path = os.path.join(out_dir, f"{sample}.sam")
-        bam_path = os.path.join(out_dir, f"{sample}.sorted.bam")
+        sorted_bam_path = os.path.join(out_dir, f"{sample}.sorted.bam")
+        filtered_bam_path = os.path.join(out_dir, f"{sample}.filtered.bam")
 
         with open(sam_path, "w") as sam_fh:
             result = subprocess.run(
@@ -264,12 +370,51 @@ def align_and_sort_bam(sample_fastq_paths: dict[str, str], reference_fasta: str,
                 raise RuntimeError(f"bwa mem failed for {sample}: {result.stderr}")
             sam_fh.write(result.stdout)
 
-        run_cmd(["samtools", "sort", "-o", bam_path, sam_path])
-        run_cmd(["samtools", "index", bam_path])
+        run_cmd(["samtools", "sort", "-o", sorted_bam_path, sam_path])
 
-        bam_paths[sample] = bam_path
+        flagstat_result = run_cmd(["samtools", "flagstat", sorted_bam_path])
+        pre_filter_metrics = parse_flagstat_summary(flagstat_result.stdout)
 
-    return bam_paths
+        run_cmd(
+            [
+                "samtools",
+                "view",
+                "-b",
+                "-q",
+                str(MIN_MAPQ),
+                "-F",
+                "2308",  # unmapped + secondary + supplementary
+                "-o",
+                filtered_bam_path,
+                sorted_bam_path,
+            ]
+        )
+        run_cmd(["samtools", "index", filtered_bam_path])
+
+        post_filter_count = count_bam_reads(filtered_bam_path)
+        reads_entering_alignment = sum(1 for _ in open_fastq(fastq_path)) // 4
+
+        bam_paths[sample] = filtered_bam_path
+        alignment_metrics[sample] = {
+            "reads_entering_alignment": reads_entering_alignment,
+            "aligned_total_records_pre_filter": pre_filter_metrics["total"],
+            "mapped_pre_filter": pre_filter_metrics["mapped"],
+            "secondary_pre_filter": pre_filter_metrics["secondary"],
+            "supplementary_pre_filter": pre_filter_metrics["supplementary"],
+            "duplicates_pre_filter": pre_filter_metrics["duplicates"],
+            "records_post_filter": post_filter_count,
+            "records_removed_by_bam_filter": max(0, pre_filter_metrics["total"] - post_filter_count),
+        }
+
+        if os.path.exists(sam_path):
+            os.remove(sam_path)
+        if os.path.exists(sorted_bam_path):
+            os.remove(sorted_bam_path)
+        bai_path = sorted_bam_path + ".bai"
+        if os.path.exists(bai_path):
+            os.remove(bai_path)
+
+    return bam_paths, alignment_metrics
 
 
 def run_featurecounts(gtf_file: str, bam_paths: dict[str, str], out_dir: str):
@@ -290,7 +435,19 @@ def run_featurecounts(gtf_file: str, bam_paths: dict[str, str], out_dir: str):
         "gene_id",
         "-t",
         "exon",
-    ] + bam_list
+        "-Q",
+        str(MIN_MAPQ),
+        "-s",
+        str(FEATURECOUNTS_STRAND),
+    ]
+
+    if FEATURECOUNTS_COUNT_PRIMARY_ONLY:
+        cmd.append("--primary")
+
+    if FEATURECOUNTS_PAIRED:
+        cmd.extend(["-p", "--countReadPairs"])
+
+    cmd.extend(bam_list)
 
     run_cmd(cmd)
     return counts_txt
@@ -313,7 +470,11 @@ def parse_featurecounts_matrix(counts_txt: str):
 
     for bam_path in bam_columns:
         bam_name = Path(bam_path).name
-        sample = bam_name.replace(".sorted.bam", "").replace(".bam", "")
+        sample = (
+            bam_name.replace(".filtered.bam", "")
+            .replace(".sorted.bam", "")
+            .replace(".bam", "")
+        )
         sample_order.append(sample)
         bam_to_sample[bam_path] = sample
 
@@ -375,7 +536,13 @@ def build_bed_from_bams(bam_paths: dict[str, str], gene_intervals: dict, bed_pat
                 out.write(f"{chrom}\t{start}\t{end}\t{name}\t0\t{strand}\n")
 
 
-def write_count_matrix_csv(count_matrix: dict, sample_names: list[str], gene_names: list[str], output_dir: str, run_id: int):
+def write_count_matrix_csv(
+    count_matrix: dict,
+    sample_names: list[str],
+    gene_names: list[str],
+    output_dir: str,
+    run_id: int,
+):
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"count_matrix_run_{run_id}.csv")
 
@@ -432,7 +599,7 @@ def main():
             os.makedirs(counts_dir, exist_ok=True)
 
             sample_fastq_paths, demux_metrics = demultiplex_fastqs(fastq_locals, demux_dir)
-            bam_paths = align_and_sort_bam(sample_fastq_paths, ref_local, align_dir)
+            bam_paths, alignment_metrics = align_and_filter_bam(sample_fastq_paths, ref_local, align_dir)
             counts_txt = run_featurecounts(gtf_local, bam_paths, counts_dir)
 
             count_matrix, sample_names, gene_names = parse_featurecounts_matrix(counts_txt)
@@ -455,20 +622,48 @@ def main():
                 for gene in gene_names
             )
 
+            records_post_filter_total = sum(
+                sample_metrics["records_post_filter"]
+                for sample_metrics in alignment_metrics.values()
+            )
+            records_removed_by_bam_filter_total = sum(
+                sample_metrics["records_removed_by_bam_filter"]
+                for sample_metrics in alignment_metrics.values()
+            )
+
             result = {
                 "reads": demux_metrics["total_reads"],
                 "assigned_reads": assigned_reads,
                 "unassigned_reads": demux_metrics["total_reads"] - assigned_reads,
                 "barcode_unassigned_reads": demux_metrics["barcode_unassigned_reads"],
+                "filtered_too_short_reads": demux_metrics["filtered_too_short_reads"],
+                "filtered_low_quality_reads": demux_metrics["filtered_low_quality_reads"],
+                "filtered_high_n_reads": demux_metrics["filtered_high_n_reads"],
+                "reads_written_after_filters": demux_metrics["reads_written_after_filters"],
                 "total_bases": demux_metrics["total_bases"],
                 "avg_read_length": demux_metrics["avg_read_length"],
                 "gc_percent": demux_metrics["gc_percent"],
+                "avg_read_length_after_filters": demux_metrics["avg_read_length_after_filters"],
+                "gc_percent_after_filters": demux_metrics["gc_percent_after_filters"],
+                "records_post_bam_filter_total": records_post_filter_total,
+                "records_removed_by_bam_filter_total": records_removed_by_bam_filter_total,
                 "data_dir": data_dir,
                 "ran_at_utc": datetime.now(timezone.utc).isoformat(),
                 "run_id": run_id,
                 "fastq_files_processed": fastq_uris,
-                "reads_per_sample_after_barcode": demux_metrics["reads_per_sample"],
+                "reads_per_sample_after_barcode_and_qc": demux_metrics["reads_per_sample"],
                 "bam_samples": sorted(bam_paths.keys()),
+                "filter_thresholds": {
+                    "barcode_length": BARCODE_LENGTH,
+                    "min_post_barcode_length": MIN_POST_BARCODE_LENGTH,
+                    "min_mean_qual": MIN_MEAN_QUAL,
+                    "max_n_frac": MAX_N_FRAC,
+                    "min_mapq": MIN_MAPQ,
+                    "featurecounts_strand": FEATURECOUNTS_STRAND,
+                    "featurecounts_paired": FEATURECOUNTS_PAIRED,
+                    "featurecounts_primary_only": FEATURECOUNTS_COUNT_PRIMARY_ONLY,
+                },
+                "alignment_metrics_by_sample": alignment_metrics,
             }
 
             output_name = f"run_{run_id}.json"
@@ -522,8 +717,8 @@ def main():
             run_id=run_id,
             read_count=result["reads"],
             total_bases=result["total_bases"],
-            avg_read_length=result["avg_read_length"],
-            gc_percent=result["gc_percent"],
+            avg_read_length=result["avg_read_length_after_filters"],
+            gc_percent=result["gc_percent_after_filters"],
             output_uri=output_uri,
         )
 
